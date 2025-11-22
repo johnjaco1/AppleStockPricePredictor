@@ -1,0 +1,212 @@
+---
+title: "Apple Stock Price"
+author: "John Jacobson"
+date: '2025-11-21'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Forecasting Apple's Stock Price Analysis
+
+```{r message=FALSE, warning=FALSE}
+library(fpp3)
+library(ggplot2)
+library(tidyverse)
+library(tseries)
+set.seed(112125)                      # controlled randomness for bootstrapping
+```
+
+```{r}
+load("~/Downloads/aapl.rda")
+```
+
+## 1) Time Series Plot
+-------------------
+
+```{r}
+# This splits and then trains and tests
+AAPL <- aapl |> mutate(Date = as.Date(Date))
+train <- filter(AAPL, Date < as.Date("2018-07-01"))
+test <- filter(AAPL, Date >= as.Date("2018-07-01"))
+
+# This plots the price
+AAPL_plot <- ggplot() + 
+  geom_line(aes(Day, Price), data = train, color = 'blue') +
+  geom_line(aes(Day, Price), data = test, color = 'blue', linetype = 2)
+
+AAPL_plot
+
+# This runs the ACF and PACF
+acf(AAPL$Price)
+pacf(AAPL$Price)
+horizon <- nrow(test)
+```
+When I looked at the time series plot of Apple’s stock price, the first thing I noticed is that the price mostly moves upward over time. It is no flat and it becomes more jumpy toward the end. There’s no real repeating pattern or seasonality that I could see. When I checked the ACF plot, almost every bar was really high, which tells me the data is not stationary and basically acts like a random walk. The PACF plot had one huge spike at lag 1 and then everything else was tiny. Based on these three plots, I learned that the series has a strong trend and a unit root, so models like the random walk or ARIMA with ARIMA(1,1,1) will probably work better.
+
+
+## Simple Forecasts
+-------------------
+
+```{r}
+
+fit_simple <- train |> 
+  model(
+    mean = MEAN(Price),
+    naive = NAIVE(Price),
+    linear = TSLM(Price ~ trend()),
+    random_walk = RW(Price ~ drift()),
+    ets = ETS(Price)
+  )
+
+fc_simple <- forecast(fit_simple, new_data = test)
+
+ggplot() +
+  geom_line(data = train, aes(Day, Price)) +
+  geom_line(data = test, aes(Day, Price), linetype = 2) +
+  geom_line(data = fc_simple, aes(Day, .mean, color = .model))
+
+# This is the in-sample
+accuracy(fit_simple) |> 
+  arrange(RMSE)
+
+# This is the out-of-sample
+accuracy(fc_simple, test) |> 
+  arrange(RMSE)
+```
+When I compared all the simple forecasting models, it was pretty clear that the random walk model did the best. On the training set, it had the lowest RMSE and MAE, and on the test set it also beat the other models by a decent amount. The mean model and the linear trend model performed pretty badly, especially out-of-sample, and the naive and ETS models were okay but not as good as random walk. Since Apple’s stock price behaves a lot like a random walk, it makes sense that this model ended up being the most accurate. I would choose the random walk model.
+
+
+
+## Arima Forecasts
+-------------------
+
+```{r}
+adf.test(AAPL$Price)
+
+# This fits 3 ARIMA models 
+fit_arima <- train |>
+  model(
+    arima111 = ARIMA(Price ~ pdq(1,1,1)),
+    arima212 = ARIMA(Price ~ pdq(2,1,2)),
+    arima131 = ARIMA(Price ~ pdq(1,1,3))
+  )
+
+# This forecasts
+fc_arima <- forecast(fit_arima, new_data = test)
+
+# Plot real data + forecasts
+ggplot() +
+  geom_line(data = train, aes(Day, Price)) +
+  geom_line(data = test, aes(Day, Price), linetype = 2) +
+  geom_line(data = fc_arima, aes(Day, .mean, color = .model))
+```
+After checking the accuracy results, the ARIMA(1,1,1) model was the best. It had the lowest errors both in the training data and the test data. The other ARIMA models were close, but ARIMA(1,1,1) predicted the actual prices the most accurately, so that’s the one I would choose.
+
+
+## Bagging
+-------------------
+
+```{r}
+fit_stl <- model(
+  train,
+  stl = STL(Price)
+)
+
+# This generates 20 bootstrapped series
+sim_data <- generate(
+  fit_stl,
+  new_data = train,
+  times = 20,
+  bootstrap_block_size = 50
+) |>
+  select(-.model)
+
+# This fits the ARIMA
+fc_bag <- sim_data |>
+  model(stlarima = ARIMA(.sim)) |>
+  forecast(h = horizon) |>
+  as.data.frame() |>
+  group_by(Day, .rep) |>
+  summarize(.mean = mean(.mean), .groups = "drop")
+
+ggplot() +
+  geom_line(data = fc_bag, aes(Day, .mean, color = .rep))
+
+# This is the average
+fc_bag3 <- fc_bag |>
+  group_by(Day) |>
+  summarize(.mean = mean(.mean), .groups = "drop")
+
+# This compares
+compare <- left_join(fc_bag3, test, by = "Day") |>
+  select(Day, .mean, Price)
+
+RMSE <- sqrt(mean((compare$.mean - compare$Price)^2))
+MAE  <- mean(abs(compare$.mean - compare$Price))
+
+RMSE
+MAE
+
+```
+After doing the STL bagging method, the final forecast looked smoother and less volatile than the earlier ARIMA models, and the RMSE and MAE were around 24.7 and 21.6. These errors are a little better than some of the simple models but not as good as the best ARIMA model from the last section. So overall, the bagged forecast helped a bit by averaging everything out.
+
+
+## Combining Forecasts
+-------------------
+
+```{r}
+# This picks the best, random walk
+best_simple <- fc_simple |> 
+  filter(.model == "random_walk")
+
+# Pick best ARIMA model arima111
+best_arima <- fc_arima |> 
+  filter(.model == "arima111")
+
+# This combines the average RW + ARIMA + Bagged
+fc_combined <- tibble(
+  Day = fc_bag3$Day,
+  combined = (best_simple$.mean + best_arima$.mean + fc_bag3$.mean) / 3
+)
+
+# This plots
+ggplot() +
+  geom_line(data = train, aes(Day, Price)) +
+  geom_line(data = test, aes(Day, Price), linetype = 2) +
+  geom_line(data = fc_combined, aes(Day, combined), color = "purple")
+
+combined_compare <- left_join(fc_combined, test, by = "Day")
+
+combined_RMSE <- sqrt(mean((combined_compare$combined - combined_compare$Price)^2))
+combined_MAE  <- mean(abs(combined_compare$combined - combined_compare$Price))
+
+combined_RMSE
+combined_MAE
+```
+After combining the random walk model, the ARIMA(1,1,1) model, and the bagged forecast, I checked the accuracy and found that the combined model had an RMSE of about 25.1 and an MAE of about 22.1. These numbers were not better than the best individual model from before, which means the combined forecast didn’t actually improve the predictions in this case. Even though the combined line looked smooth on the plot, the accuracy shows that it wasn’t more accurate overall.
+
+
+## Full Forecast
+-------------------
+
+```{r}
+# This fits the best ARIMA model on the full data
+fit_full <- AAPL |>
+  model(arima111 = ARIMA(Price ~ pdq(1,1,1)))
+
+# This forecasts the next 100 days
+fc_full <- forecast(fit_full, h = 100)
+
+# This plots the actual data + forecast using autolayer
+aapl |>
+  ggplot(aes(Day, Price)) +
+  geom_line() +
+  autolayer(fc_full, color = "red") +
+  labs(title = "ARIMA(1,1,1) Forecast for Next 100 Days",
+       y = "Price", x = "Day") +
+  theme_minimal()
+```
+For my final forecast, I used the ARIMA(1,1,1) model again because it was the most accurate method earlier. I fit the model on the full dataset and forecasted the next 100 days. The red line shows the model’s predicted average future price, and the shaded areas around it are the 80% and 95% prediction intervals. These intervals get wider the further out the forecast goes, which makes sense because the model becomes less certain over time. Overall, the forecast suggests that prices will level off in the near future and the intervals give a realistic sense of the possible range the stock might fall into.
